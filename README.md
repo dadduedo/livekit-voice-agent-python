@@ -6,10 +6,13 @@ A basic example of a voice agent using LiveKit and Python. Has a few extras to g
   - Get weather
   - Get current time
 - Summary usage logging
+- Optional inbound calls with Twilio
+- Krisp noise cancellation
+- Inbound calls switch to a model optimized for telephony
 
 ## Dev Setup
 
-Clone the repository then run following command to:
+Clone the repository then run following the commands to:
 - change directory to `livekit-voice-agent-python`
 - create a virtual environment and activate it
 - install dependencies
