@@ -12,7 +12,7 @@ A basic example of a voice agent using LiveKit and Python. Has a few extras to g
 
 ## Dev Setup
 
-Clone the repository then run following the commands to:
+Clone the repository then run the following commands to:
 - change directory to `livekit-voice-agent-python`
 - create a virtual environment and activate it
 - install dependencies
