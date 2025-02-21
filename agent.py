@@ -16,6 +16,7 @@ from livekit.agents import (
     metrics,
 )
 from livekit.agents.pipeline import AgentCallContext, VoicePipelineAgent
+from livekit.rtc import ParticipantKind
 from livekit.plugins import openai, deepgram, elevenlabs, silero, turn_detector
 
 
@@ -106,13 +107,18 @@ async def entrypoint(ctx: JobContext):
     logger.info(f"participant.name: {participant.name}")
     logger.info(f"participant.attributes: {participant.attributes}")
 
+    dg_model = "nova-2-general"
+    if participant.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
+        # use a model optimized for telephony
+        dg_model = "nova-2-phonecall"
+
     # This project is configured to use Deepgram STT, OpenAI LLM and ElevenLabs TTS plugins
-    # Other great providers exist like Cerebras, Cartesia, Groq, Play.ht, Rime, and more
+    # Other providers exist like Cerebras, Cartesia, Groq, Play.ht, Rime, and more
     # Learn more and pick the best one for your app:
     # https://docs.livekit.io/agents/plugins
     agent = VoicePipelineAgent(
         vad=ctx.proc.userdata["vad"],
-        stt=deepgram.STT(),
+        stt=deepgram.STT(model=dg_model),
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=elevenlabs.TTS(),
         turn_detector=turn_detector.EOUModel(),
@@ -149,5 +155,6 @@ if __name__ == "__main__":
         WorkerOptions(
             entrypoint_fnc=entrypoint,
             prewarm_fnc=prewarm,
+            agent_name="inbound-agent",
         ),
     )
