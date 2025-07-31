@@ -1,0 +1,17 @@
+https://github.com/livekit-examples/agent-deployment
+
+fly auth login
+
+fly app create ubaid-agent-new
+
+fly secrets set --app ubaid-agent-new LIVEKIT_URL="wss://bhanuagent-c9rq637r.livekit.cloud" 
+fly secrets set --app ubaid-agent-new LIVEKIT_API_KEY="APIztq4C7nASZbT"
+fly secrets set --app ubaid-agent-new LIVEKIT_API_SECRET="MjqGdVHa2D44nuiuOb98BehSvKhWOOuA5KuCJZZS6CX"
+
+fly deploy -c fly.toml 
+
+fly scale count 1 --app ubaid-agent-new
+
+
+
+ 

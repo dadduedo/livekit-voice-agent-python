@@ -1,160 +1,206 @@
-import re
-import random
+import asyncio
+import json
 import logging
-import aiohttp
-from datetime import datetime
-from typing import Annotated
 
 from dotenv import load_dotenv
-from livekit.agents import (
-    AutoSubscribe,
-    JobContext,
-    JobProcess,
-    WorkerOptions,
-    cli,
-    llm,
-    metrics,
-)
-from livekit.agents.pipeline import AgentCallContext, VoicePipelineAgent
-from livekit.rtc import ParticipantKind
-from livekit.plugins import openai, deepgram, elevenlabs, silero, turn_detector
+from livekit import agents
+from livekit.agents import AgentSession, Agent, RoomInputOptions, RunContext
+from livekit.agents.llm import function_tool
+from livekit.plugins import openai
+
+import requests
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from livekit.agents import ConversationItemAddedEvent, CloseEvent
+
+load_dotenv()
+logging.basicConfig(level=logging.DEBUG)
+
+class Assistant(Agent):
+
+    @function_tool()
+    async def check_availability(self, context: RunContext, start_time: str, end_time: str):
+        url = "https://api.cal.com/v1/slots"
+        querystring = {
+            "apiKey": "cal_live_a34c0ef9eaab0746dc7bd5511f74510f",
+            "eventTypeId": "2029915",
+            "startTime": start_time,
+            "endTime": end_time,
+            "timeZone": "Europe/Rome"
+        }
+        try:
+            response = requests.get(url, params=querystring)
+            response.raise_for_status()
+            print("Availability API response:", response.text)
+            return response.json()
+        except requests.RequestException as e:
+            print("Error in check_availability:", e)
+            return {"error": "Unable to check availability"}
+
+    @function_tool()
+    async def book_appointment(self, context: RunContext, name: str, email: str, start_time: str):
+        url = "https://api.cal.com/v2/bookings"
+        payload = {
+            "start": start_time,
+            "attendee": {
+                "name": name,
+                "email": email,
+                "timeZone": "Europe/Rome",
+                "language": "it"
+            },
+            "eventTypeId": 2029915,
+            "eventTypeSlug": "my-event-type",
+            "organizationSlug": "acme-corp",
+        }
+        headers = {
+            "cal-api-version": "2024-08-13",
+            "Content-Type": "application/json"
+        }
+        try:
+            response = requests.post(url, json=payload, headers=headers)
+            response.raise_for_status()
+            print("Booking API response:", response.text)
+            return response.json()
+        except requests.RequestException as e:
+            print("Error in book_appointment:", e)
+            return {"error": "Unable to book appointment"}
+
+    def __init__(self) -> None:
+        super().__init__(instructions=f"""
+## Identity
+You are Martina, Michele’s AI secretary. You help clients schedule appointments with Michele.
+Always speak Italian.
+
+## Role
+You handle client calls and guide them naturally through the process of booking an appointment.
+
+## Behavior
+- Be warm, professional and conversational.
+- Ask about their situation to understand their needs.
+- Suggest a free video call with Michele to explore solutions.
+- Ask for their preferred time (morning or afternoon).
+- Request and confirm their email address politely.
+- Call the `check_availability` tool to check Michele's availability.
+- If available, call `book_appointment` to schedule.
+- End the call thanking the client and offering further assistance.
+
+SYSTEM: Current date and time is {datetime.now(ZoneInfo("Europe/Rome"))}.
+""")
+        self.chat_history = []
+        self.caller_phone_number = None
 
 
-load_dotenv(dotenv_path=".env.local")
-logger = logging.getLogger("voice-agent")
+async def entrypoint(ctx: agents.JobContext):
+    global session
+    print("👋 Agent avviato su stanza:", ctx.room)
+    assistant = Assistant()
+    start_time = datetime.now()
 
+    async def on_session_close():
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        print("------- Session has ended. Performing cleanup. --------")
 
-class AssistantFnc(llm.FunctionContext):
-    # the llm.ai_callable decorator marks this function as a tool available to the LLM
-    # by default, it'll use the docstring as the function's description
-    @llm.ai_callable()
-    async def get_weather(
-        self,
-        # by using the Annotated type, arg description and type are available to the LLM
-        location: Annotated[
-            str, llm.TypeInfo(description="The location to get the weather for")
-        ],
-    ):
-        """Called when the user asks about the weather. This function will return the weather for the given location."""
-        # Clean the location string of special characters
-        location = re.sub(r"[^a-zA-Z0-9]+", " ", location).strip()
+        data = {
+            "called_number": getattr(assistant, "caller_phone_number", "unknown"),
+            "chat_transcript": getattr(assistant, "chat_history", []),
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "duration_seconds": duration
+        }
+        try:
+            print("Webhook data payload:", json.dumps(data, indent=2))
+            response = requests.post(
+                "https://webhook.latenode.com/1415/dev/2dbfb0bb-7b12-4f2e-9c66-6a8750532001", 
+                json=data
+            )
+            print("Webhook status:", response.status_code, "Response:", response.text)
+        except requests.RequestException as e:
+            print("Error sending webhook:", e)
 
-        # When a function call is running, there are a couple of options to inform the user
-        # that it might take awhile:
-        # Option 1: you can use .say filler message immediately after the call is triggered
-        # Option 2: you can prompt the agent to return a text response when it's making a function call
-        agent = AgentCallContext.get_current().agent
+        assistant.chat_history.clear()
 
-        if (
-            not agent.chat_ctx.messages
-            or agent.chat_ctx.messages[-1].role != "assistant"
-        ):
-            # skip if assistant already said something
-            filler_messages = [
-                "Let me check the weather in {location} for you.",
-                "Let me see what the weather is like in {location} right now.",
-                # LLM will complete this sentence if it is added to the end of the chat context
-                "The current weather in {location} is ",
-            ]
-            message = random.choice(filler_messages).format(location=location)
-            logger.info(f"saying filler message: {message}")
+    ctx.add_shutdown_callback(on_session_close)
+    await ctx.connect()
 
-            # NOTE: set add_to_chat_ctx=True will add the message to the end
-            #   of the chat context of the function call for answer synthesis
-            speech_handle = await agent.say(message, add_to_chat_ctx=True)  # noqa: F841
-
-        logger.info(f"getting weather for {location}")
-        url = f"https://wttr.in/{location}?format=%C+%t"
-        weather_data = ""
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                if response.status == 200:
-                    weather_data = (f"The weather in {location} is {await response.text()}.")
-                    logger.info(f"weather data: {weather_data}")
-                else:
-                    raise f"Failed to get weather data, status code: {response.status}"
-                
-        # (optional) To wait for the speech to finish before giving results of the function call
-        # await speech_handle.join()
-        return weather_data
-    
-    @llm.ai_callable()
-    def get_time(self):
-        """called to retrieve the current local time"""
-        return datetime.now().strftime("%H:%M:%S")
-
-
-def prewarm(proc: JobProcess):
-    proc.userdata["vad"] = silero.VAD.load()
-
-
-async def entrypoint(ctx: JobContext):
-    initial_ctx = llm.ChatContext().append(
-        role="system",
-        text=(
-            "You are a voice assistant created by LiveKit. Your interface with users will be voice. "
-            "You should use short and concise responses, and avoiding usage of unpronouncable punctuation. "
-            "You were created as a demo to showcase the capabilities of LiveKit's agents framework."
-        ),
+    session = AgentSession(
+        llm=openai.realtime.RealtimeModel(voice="shimmer"),
+        tts=openai.TTS(model="gpt-4o-mini-tts", voice="shimmer"),
     )
 
-    logger.info(f"connecting to room {ctx.room.name}")
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-
-    # Wait for the first participant to connect
+    await session.start(
+        room=ctx.room,
+        agent=assistant,
+        room_input_options=RoomInputOptions(),
+    )
+    asyncio.create_task(auto_hangup_after_duration())
     participant = await ctx.wait_for_participant()
-    logger.info(f"starting voice assistant for participant {participant.identity}")
-    logger.info(f"participant.name: {participant.name}")
-    logger.info(f"participant.attributes: {participant.attributes}")
+    attributes = getattr(participant, "attributes", {})
+    assistant.recording_url = attributes.get("sip.X-RecordingUrl")
+    assistant.caller_phone_number = attributes.get("sip.phoneNumber")
 
-    dg_model = "nova-2-general"
-    if participant.kind == ParticipantKind.PARTICIPANT_KIND_SIP:
-        # use a model optimized for telephony
-        dg_model = "nova-2-phonecall"
+    print("Incoming call from:", assistant.caller_phone_number or "unknown")
 
-    # This project is configured to use Deepgram STT, OpenAI LLM and ElevenLabs TTS plugins
-    # Other providers exist like Cerebras, Cartesia, Groq, Play.ht, Rime, and more
-    # Learn more and pick the best one for your app:
-    # https://docs.livekit.io/agents/plugins
-    agent = VoicePipelineAgent(
-        vad=ctx.proc.userdata["vad"],
-        stt=deepgram.STT(model=dg_model),
-        llm=openai.LLM(model="gpt-4o-mini"),
-        tts=elevenlabs.TTS(),
-        turn_detector=turn_detector.EOUModel(),
-        # minimum delay for endpointing, used when turn detector believes the user is done with their turn
-        min_endpointing_delay=0.5,
-        # maximum delay for endpointing, used when turn detector does not believe the user is done with their turn
-        max_endpointing_delay=5.0,
-        chat_ctx=initial_ctx,
-        fnc_ctx=AssistantFnc(),
-    )
+    
+    await session.say("Ciao, sono Martina, l’assistente di Michele. Come posso aiutarti?")
 
-    usage_collector = metrics.UsageCollector()
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(event: ConversationItemAddedEvent):
+        asyncio.create_task(handle_conversation_item(event))
 
-    @agent.on("metrics_collected")
-    def on_metrics_collected(agent_metrics: metrics.AgentMetrics):
-        metrics.log_metrics(agent_metrics)
-        usage_collector.collect(agent_metrics)
+    reply_lock = asyncio.Lock()
 
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Summary Usage: {summary}")
+    async def handle_conversation_item(event: ConversationItemAddedEvent):
+        async with reply_lock:
+            await reset_silence_timer()
+            assistant.chat_history.append(f"{event.item.role}: {event.item.text_content}")
 
-    # At shutdown, generate and log the summary from the usage collector
-    ctx.add_shutdown_callback(log_usage)
+            try:
+                reply = await session.generate_reply(
+                    user_input=event.item.text_content,
+                    allow_interruptions=True,
+                )
+                await session.say(reply)
+            except Exception as e:
+                print("Errore nel generare o pronunciare la risposta:", e)
 
-    agent.start(ctx.room, participant)
 
-    # The agent greeting when the user joins
-    await agent.say("Hey, how can I help you today?", allow_interruptions=True)
+    @session.on("close")
+    def on_close(event: CloseEvent):
+        print("Session closed:", event)
 
+async def auto_hangup_after_duration():
+    await asyncio.sleep(300)  # 5 minuti
+    print("🕐 Durata massima raggiunta: chiudo la chiamata.")
+    await session.say("La chiamata ha raggiunto il tempo massimo. Ti auguro una buona giornata!")
+    await session.close()
+
+   
+silence_timer = None    
+async def reset_silence_timer():
+    global silence_timer
+
+    # Cancella il timer esistente, se presente
+    if silence_timer:
+        silence_timer.cancel()
+
+    # Avvia un nuovo timer
+    silence_timer = asyncio.create_task(silence_timeout())
+
+async def silence_timeout():
+    try:
+        await asyncio.sleep(30)  # 30 secondi di inattività
+        print("🔇 Nessuna attività rilevata per 30 secondi. Chiudo la chiamata.")
+        await session.say("Sembra che la linea sia silenziosa da un po'. Chiudo la chiamata, ma puoi richiamare quando vuoi.")
+        await session.close()
+    except asyncio.CancelledError:
+        pass  # Timer cancellato (perché c'è attività)
 
 if __name__ == "__main__":
-    cli.run_app(
-        WorkerOptions(
+    agents.cli.run_app(
+        agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
-            prewarm_fnc=prewarm,
             agent_name="inbound-agent",
-        ),
+        )
     )

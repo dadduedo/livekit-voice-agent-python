@@ -1,0 +1,24 @@
+{
+    "name": "Inbound Dispatch Rule",
+    "trunk_ids": [
+        "ST_wJAmxwtKQa7y"
+    ],
+    "routes": [
+    {
+      "destination": "sip:3ukp99mbr2u.sip.livekit.cloud",
+      "timeout": "30s"
+    }
+    ],
+    "rule": {
+        "dispatchRuleIndividual": {
+            "roomPrefix": "call"
+        }
+    },
+    "room_config": {
+        "agents": [
+            {
+                "agent_name": "inbound-agent"
+            }
+        ]
+    }
+}
